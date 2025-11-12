@@ -7,38 +7,55 @@ import time
 import json
 from datetime import date
 import io # Used to save files in memory
+from docx import Document # <-- NEW: For Word docs
+from docx.shared import Pt # <-- NEW: For setting font sizes
 
-# --- (1) PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="VCE AI Teacher Toolkit",
-    layout="wide"
-)
-
-# --- (2) PERSISTENT FILE HELPERS (for Gems) ---
-# This app is "stateless" (no chat history) but we'll save Gems
-def load_gems(filename="gems.json", default_data={}):
+# --- (1) PERSISTENT FILE HELPERS ---
+def load_from_file(filename, default_data):
+    """Loads data from a JSON file. If file doesn't exist or is old, creates a new one."""
+    today_str = str(date.today())
+    
     if not os.path.exists(filename):
         save_to_file(filename, default_data)
         return default_data
+    
     try:
         with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        
+        if filename == "usage.json" and data.get("date") != today_str:
+            st.success("New day! Resetting API counters.")
+            save_to_file(filename, default_data)
+            return default_data
+        
+        if filename == "usage.json" and "count" in data and "counts" not in data:
+            new_data = {
+                "date": data.get("date", today_str),
+                "counts": {"total_legacy_calls": data.get("count", 0)}
+            }
+            save_to_file(filename, new_data)
+            return new_data
+
+        return data
+            
     except json.JSONDecodeError:
+        st.error(f"Error reading {filename}. File might be corrupt. Creating a new one.")
+        save_to_file(filename, default_data)
         return default_data
 
 def save_to_file(filename, data):
+    """Saves data to a JSON file."""
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-# --- (3) CORE GEMINI API FUNCTION ---
-# This is our global function to call the API, now with smart delays
+# --- (2) CORE GEMINI API FUNCTION ---
 DELAYS = {
     "gemini-2.5-flash-lite": 5,
     "gemini-2.5-flash": 7,
     "gemini-2.5-pro": 13
 }
 
-def call_gemini_api(system_prompt, user_prompt, temperature, model_name):
+def call_gemini_api(system_prompt, user_prompt, temperature, model_name, chat_history=None):
     """A single, safe function to call the Gemini API."""
     api_key = st.session_state.get("api_key")
     if not api_key:
@@ -54,60 +71,94 @@ def call_gemini_api(system_prompt, user_prompt, temperature, model_name):
             generation_config=config
         )
         
-        response = model.generate_content(user_prompt)
+        if chat_history:
+            chat = model.start_chat(history=chat_history)
+            response = chat.send_message(user_prompt)
+        else:
+            response = model.generate_content(user_prompt)
+        
+        if model_name not in st.session_state.usage_data["counts"]:
+            st.session_state.usage_data["counts"][model_name] = 0
+        st.session_state.usage_data["counts"][model_name] += 1
+        save_to_file("usage.json", st.session_state.usage_data)
+        
         delay = DELAYS.get(model_name, 7)
         time.sleep(delay)
+        
         return response.text
 
     except Exception as e:
         st.error(f"An API error occurred: {e}")
         return None
 
-# --- (4) DEFAULT GEMS & DATA ---
+def create_toc_from_headings(html_content):
+    """Scans final HTML for h2 tags and builds a ToC."""
+    st.write("    > Building Table of Contents...")
+    headings = re.findall(
+        r'<h2\s+id=["\'](.*?)["\']>(.*?)</h2>', 
+        html_content,
+        re.IGNORECASE
+    )
+    if not headings:
+        st.write("    > No h2 headings with IDs found. Skipping ToC.")
+        return ""
+    toc_lines = ['<details class="toc" open><summary>Table of Contents</summary><ul>']
+    for id, text in headings:
+        toc_lines.append(f'<li><a href="#{id}">{text}</a></li>')
+    toc_lines.append('</ul></details><br><hr><br>')
+    st.write(f"    > ToC created with {len(headings)} entries.")
+    return "\n".join(toc_lines)
+
+# --- (3) DEFAULT DATA (FOR NEW FILES) ---
 DEFAULT_GEMS = {
-    "Blank Gem": "You are a helpful assistant.",
+    "Blank Chat Prompt": "You are a helpful assistant.",
     
+    # --- NEW: Upgraded Test Generator Gem ---
     "Test Generator (.docx)": """
-You are an expert VCE exam designer. Your task is to generate a test in a specific format.
-The user will provide the test format, a topic, and the number of questions.
+You are an expert VCE Psychology exam designer.
+Your task is to generate multiple-choice questions based on a topic.
+Your output MUST be a single JSON object.
+The JSON object must contain one key, "questions", which is a list.
+Each item in the list must be an object with a "question_text" (the question) and a "options" (a list of 4 strings, A-D).
 
-**YOUR INSTRUCTIONS:**
-1.  **Strictly Follow Format:** Adhere *exactly* to the provided test format.
-2.  **Generate Content:** Create the requested number of questions on the given topic, matching the style of the format.
-3.  **Provide Answers:** After the test, include a separate "Answer Key" section.
-4.  **Output:** Your output must be plain text, ready to be pasted into a Word document. Do not use Markdown or HTML.
+**EXAMPLE:**
+{
+  "questions": [
+    {
+      "question_text": "The tendency to attribute our successes to internal factors and failures to external factors is called:",
+      "options": [
+        "A. Fundamental attribution error",
+        "B. Actor-observer bias",
+        "C. Self-serving bias",
+        "D. Cognitive dissonance"
+      ]
+    },
+    {
+      "question_text": "The affective component of an attitude involves:",
+      "options": [
+        "A. Observable behaviours toward an object, person, or event",
+        "B. Beliefs or thoughts about something",
+        "C. Feelings or emotional reactions",
+        "D. Judgements based on logic"
+      ]
+    }
+  ]
+}
 """,
-
     "PowerPoint Generator (.pptx)": """
 You are an expert VCE educator. Your task is to generate the *content* for a PowerPoint presentation based on a textbook chunk.
 The output format MUST be a specific JSON structure.
-
-**INPUT:**
-You will receive a chunk of text from a textbook.
-
-**YOUR TASK:**
-1.  Read the text and identify the main title and key concepts.
-2.  Generate a title slide and several content slides based on the text.
-3.  Respond *only* with a JSON object in this exact format:
-    {
-      "slides": [
-        {"title": "Slide 1 Title", "body": ["Bullet point 1", "Bullet point 2"]},
-        {"title": "Slide 2 Title", "body": ["Bullet point 1", "Bullet point 2", "Bullet point 3"]},
-        {"title": "Slide 3 Title", "body": ["Bullet point 1", "Bullet point 2"]}
-      ]
-    }
+**EXAMPLE:**
+{
+  "slides": [
+    {"title": "Slide 1 Title", "body": ["Bullet point 1", "Bullet point 2"]},
+    {"title": "Slide 2 Title", "body": ["Bullet point 1", "Bullet point 2", "Bullet point 3"]}
+  ]
+}
 """,
     "Gimkit Generator (.csv)": """
 You are a question generator. Your task is to create a list of questions and answers on a given topic.
 The output format MUST be a valid CSV (Comma Separated Values) text.
-
-**YOUR INSTRUCTIONS:**
-1.  Generate the requested number of question/answer pairs.
-2.  Format your output as two columns: "Question", "Answer".
-3.  Do NOT include a header row.
-4.  Each question must be in quotes if it contains a comma.
-5.  Each answer must be in quotes.
-
 **EXAMPLE OUTPUT:**
 "What is the capital of France?","Paris"
 "Who wrote Hamlet?","William Shakespeare"
@@ -128,29 +179,67 @@ Generate a concise, constructive comment (1-2 paragraphs) for a student report.
 -   Maintain a professional and encouraging tone.
 """
 }
+DEFAULT_USAGE = {
+    "date": str(date.today()),
+    "counts": {
+        "gemini-2.5-flash-lite": 0,
+        "gemini-2.5-flash": 0,
+        "gemini-2.5-pro": 0
+    }
+}
+DEFAULT_CHATS = {}
 
-# --- (5) THIS IS THE MAIN FUNCTION THAT RUNS THE APP ---
+OUTPUT_FOLDER = r'C:\Users\hgh\OneDrive - Brentwood Secondary College\Desktop\Textbook_HTML_Files'
+
+
+# --- (4) THIS IS THE MAIN FUNCTION THAT RUNS THE APP ---
 def main():
     """Main function to run the Streamlit app."""
     
     st.set_page_config(page_title="VCE AI Teacher Toolkit", layout="wide")
 
-    # --- (A) SESSION STATE INITIALIZATION ---
+    st.markdown("""
+    <style>
+        .toc { background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 8px; padding: 15px 25px; margin-bottom: 25px; }
+        .toc summary { font-size: 1.2em; font-weight: bold; cursor: pointer; }
+        .toc ul { margin-top: 10px; }
+        .toc li { margin-bottom: 5px; }
+        .toc a { text-decoration: none; color: #0066cc; }
+        .toc a:hover { text-decoration: underline; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    # --- (B) SESSION STATE INITIALIZATION ---
     if "api_key" not in st.session_state:
         st.session_state.api_key = None
+
     if "gems" not in st.session_state:
-        st.session_state.gems = load_gems("gems.json", DEFAULT_GEMS)
+        st.session_state.gems = load_from_file("gems.json", DEFAULT_GEMS)
         
-        # Migration Check: Add missing default Gems
         migrated = False
         for gem_name, gem_prompt in DEFAULT_GEMS.items():
             if gem_name not in st.session_state.gems:
                 st.session_state.gems[gem_name] = gem_prompt
                 migrated = True
+        
         if migrated:
             save_to_file("gems.json", st.session_state.gems)
+            st.info("Added missing default Gems to your 'gems.json' file!")
+            time.sleep(2)
+            st.rerun()
 
-    # --- (B) UI: SIDEBAR ---
+    if "usage_data" not in st.session_state:
+        st.session_state.usage_data = load_from_file("usage.json", DEFAULT_USAGE)
+
+    if "chats" not in st.session_state:
+        st.session_state.chats = load_from_file("chats.json", DEFAULT_CHATS)
+
+    if "current_chat_id" not in st.session_state:
+        st.session_state.current_chat_id = None
+
+    # --- (C) UI: SIDEBAR ---
     st.sidebar.title("VCE AI Teacher Toolkit")
     st.sidebar.markdown("Welcome! This app helps you generate VCE resources. **Please enter your own Google API key below to get started.**")
 
@@ -173,7 +262,42 @@ def main():
         help="0.0 = Factual, 2.0 = Creative"
     )
 
-    # --- (C) UI: MAIN PAGE (TABS) ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Daily Usage")
+    counts = st.session_state.usage_data.get("counts", {})
+    LIMITS = {"gemini-2.5-flash-lite": 1000, "gemini-2.5-flash": 250, "gemini-2.5-pro": 50}
+
+    if not counts:
+        st.sidebar.text("No calls made today.")
+    else:
+        for model, count in counts.items():
+            limit = LIMITS.get(model, 1)
+            label = f"{model} ({count} / {limit})"
+            progress = min(count / limit, 1.0)
+            st.sidebar.text(label)
+            st.sidebar.progress(progress)
+
+    if st.sidebar.button("Reset All Counters"):
+        st.session_state.usage_data = DEFAULT_USAGE
+        save_to_file("usage.json", st.session_state.usage_data)
+        st.rerun()
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Saved Chats")
+
+    if st.sidebar.button("New Chat", use_container_width=True):
+        st.session_state.current_chat_id = None
+        st.rerun()
+
+    sorted_chat_ids = sorted(st.session_state.chats.keys(), reverse=True)
+
+    for chat_id in sorted_chat_ids:
+        chat_title = st.session_state.chats[chat_id]["title"]
+        if st.sidebar.button(chat_title, key=f"chat_{chat_id}", use_container_width=True):
+            st.session_state.current_chat_id = chat_id
+            st.rerun()
+
+    # --- (D) UI: MAIN PAGE (TABS) ---
     st.title("VCE Resource Generators")
     
     tab_test, tab_ppt, tab_gimkit, tab_comment, tab_gems = st.tabs([
@@ -184,9 +308,11 @@ def main():
         "Gem Creator"
     ])
 
-    # --- TAB 1: TEST GENERATOR ---
+    # --- TAB 1: TEST GENERATOR (REBUILT) ---
     with tab_test:
         st.header("Test Generator (.docx)")
+        st.info("This tool uses a `test_template.docx` file in your app folder. Create one with your school's title page and add the placeholder `{{QUESTIONS_GO_HERE}}` where you want the questions to be inserted.")
+        
         gem_name = "Test Generator (.docx)"
         
         with st.expander("View/Edit Gem Prompt"):
@@ -197,23 +323,15 @@ def main():
                 key="gem_test"
             )
         
-        col1, col2 = st.columns(2)
-        with col1:
-            topic = st.text_input("Topic for the test:", "e.g., The Atkinson-Shiffrin Model")
-            num_questions = st.number_input("Number of questions:", min_value=1, max_value=20, value=5)
-        with col2:
-            test_format = st.text_area(
-                "Paste your test format here:",
-                value="e.g., Question 1: Multiple Choice (2 marks)\nQuestion 2: Short Answer (4 marks)\n...",
-                height=150
-            )
+        topic = st.text_input("Topic for the test:", "e.g., The Atkinson-Shiffrin Model")
+        num_questions = st.number_input("Number of questions:", min_value=1, max_value=20, value=5)
 
         if st.button("Generate Test"):
-            if not topic or not test_format:
+            if not topic:
                 st.warning("Please fill in all fields.")
             else:
-                user_prompt = f"Topic: {topic}\nNumber of Questions: {num_questions}\nTest Format:\n{test_format}"
-                with st.spinner("Generating test and answer key..."):
+                user_prompt = f"Topic: {topic}\nNumber of Questions: {num_questions}"
+                with st.spinner("Calling Gemini to generate questions (as JSON)..."):
                     response = call_gemini_api(
                         st.session_state.gems[gem_name],
                         user_prompt,
@@ -222,24 +340,76 @@ def main():
                     )
                 
                 if response:
-                    st.success("Test generated!")
-                    from docx import Document
-                    
-                    # Create a Word doc in memory
-                    doc = Document()
-                    doc.add_heading(f"{topic} - Test", 0)
-                    doc.add_paragraph(response)
-                    
-                    # Save to a memory buffer
-                    bio = io.BytesIO()
-                    doc.save(bio)
-                    
-                    st.download_button(
-                        label="Download Test as .docx",
-                        data=bio.getvalue(),
-                        file_name=f"{topic.replace(' ', '_')}_test.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
+                    try:
+                        st.write("  > AI returned content. Parsing JSON...")
+                        # Clean the response from markdown backticks
+                        response_clean = re.sub(r'```json\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
+                        data = json.loads(response_clean)
+                        
+                        st.write("  > JSON parsed. Opening `test_template.docx`...")
+                        
+                        # Check if template exists
+                        if not os.path.exists("test_template.docx"):
+                            st.error("`test_template.docx` not found! Please create it in the same folder as the app.")
+                            st.stop()
+                            
+                        doc = Document("test_template.docx")
+                        
+                        # Find the placeholder
+                        found_placeholder = False
+                        for para in doc.paragraphs:
+                            if "{{QUESTIONS_GO_HERE}}" in para.text:
+                                # Found it! Clear the placeholder text
+                                para.text = ""
+                                
+                                # Add our new content
+                                st.write("  > Found placeholder. Injecting questions...")
+                                
+                                # Add Section A title
+                                p_section = doc.add_paragraph()
+                                p_section.add_run("SECTION A – Multiple-Choice Questions").bold = True
+                                
+                                p_instructions = doc.add_paragraph()
+                                p_instructions.add_run("Answer all questions by selecting the correct option.")
+                                p_instructions.style = 'List Paragraph'
+
+                                for i, q_data in enumerate(data.get("questions", [])):
+                                    # Add Question X (with a space before it)
+                                    doc.add_paragraph() 
+                                    q_para = doc.add_paragraph()
+                                    q_para.add_run(f"Question {i+1}\n").bold = True
+                                    q_para.add_run(q_data.get("question_text", ""))
+                                    
+                                    # Add options (A, B, C, D)
+                                    for opt in q_data.get("options", []):
+                                        doc.add_paragraph(opt, style='List Paragraph')
+                                
+                                found_placeholder = True
+                                break # Stop searching
+                        
+                        if not found_placeholder:
+                            st.error("Could not find the '{{QUESTIONS_GO_HERE}}' placeholder in 'test_template.docx'.")
+                            st.stop()
+
+                        # Save to a memory buffer
+                        st.write("  > Saving to memory buffer...")
+                        bio = io.BytesIO()
+                        doc.save(bio)
+                        
+                        st.success("Test generated!")
+                        st.download_button(
+                            label="Download Test as .docx",
+                            data=bio.getvalue(),
+                            file_name=f"{topic.replace(' ', '_')}_test.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                        
+                    except json.JSONDecodeError:
+                        st.error("AI returned invalid JSON. Could not create .docx.")
+                        st.text_area("Raw AI Output (for debugging):", value=response, height=200)
+                    except Exception as e:
+                        st.error(f"Failed to create .docx file. Error: {e}")
+                        st.text_area("Raw AI Output (for debugging):", value=response, height=200)
 
     # --- TAB 2: POWERPOINT GENERATOR ---
     with tab_ppt:
@@ -254,18 +424,22 @@ def main():
                 key="gem_ppt"
             )
 
-        uploaded_file = st.file_uploader("Upload your textbook (PDF)", type="pdf")
+        uploaded_file = st.file_uploader("Upload your textbook (PDF)", type="pdf", key="ppt_uploader")
         
         if st.button("Generate PowerPoint"):
             if not uploaded_file:
                 st.warning("Please upload a PDF file.")
+            elif not st.session_state.api_key:
+                st.error("API Key not set.")
             else:
                 with st.spinner(f"Reading {uploaded_file.name}..."):
                     try:
                         with pdfplumber.open(uploaded_file) as pdf:
                             text_content = ""
-                            for page in pdf.pages:
+                            # Only read first 10 pages to save tokens
+                            for page in pdf.pages[:10]: 
                                 text_content += page.extract_text() + "\n"
+                        st.info("Reading first 10 pages of PDF...")
                     except Exception as e:
                         st.error(f"Failed to read PDF. Error: {e}")
                         text_content = None
@@ -281,7 +455,7 @@ def main():
                     
                     if response:
                         try:
-                            # Clean the response from markdown backticks
+                            st.write("  > AI returned content. Parsing JSON...")
                             response_clean = re.sub(r'```json\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
                             slide_data = json.loads(response_clean)
                             
@@ -292,15 +466,21 @@ def main():
                             for slide_info in slide_data.get("slides", []):
                                 slide_layout = prs.slide_layouts[1] # 1 is "Title and Content"
                                 slide = prs.slides.add_slide(slide_layout)
-                                slide.shapes.title.text = slide_info.get("title", "No Title")
+                                
+                                if slide.shapes.title:
+                                    slide.shapes.title.text = slide_info.get("title", "No Title")
                                 
                                 content_frame = slide.placeholders[1].text_frame
-                                for body_item in slide_info.get("body", []):
+                                content_frame.clear() # Clear existing placeholder text
+                                
+                                p = content_frame.paragraphs[0]
+                                p.text = slide_info.get("body", [""])[0] # Add first bullet
+                                
+                                # Add remaining bullets
+                                for body_item in slide_info.get("body", [])[1:]:
                                     p = content_frame.add_paragraph()
                                     p.text = body_item
-                                    p.level = 0
                             
-                            # Save to a memory buffer
                             bio = io.BytesIO()
                             prs.save(bio)
                             
@@ -338,6 +518,8 @@ def main():
         if st.button("Generate Gimkit CSV"):
             if not topic_gimkit:
                 st.warning("Please enter a topic.")
+            elif not st.session_state.api_key:
+                st.error("API Key not set.")
             else:
                 user_prompt = f"Topic: {topic_gimkit}\nNumber of Questions: {num_gimkit}"
                 with st.spinner("Generating questions..."):
@@ -350,13 +532,11 @@ def main():
                 
                 if response:
                     st.success("CSV content generated!")
-                    
-                    # Clean the response from markdown backticks
                     response_clean = re.sub(r'```csv\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
                     
                     st.download_button(
                         label="Download Gimkit CSV",
-                        data=response_clean.encode('utf-8'), # Encode to bytes
+                        data=response_clean.encode('utf-8'),
                         file_name=f"{topic_gimkit.replace(' ', '_')}_gimkit.csv",
                         mime="text/csv"
                     )
@@ -390,6 +570,8 @@ def main():
         if st.button("Generate Comment"):
             if not questions or not rubric or not student_performance:
                 st.warning("Please fill in all three fields.")
+            elif not st.session_state.api_key:
+                st.error("API Key not set.")
             else:
                 user_prompt = f"TEST QUESTIONS:\n{questions}\n\nRUBRIC:\n{rubric}\n\nSTUDENT PERFORMANCE:\n{student_performance}"
                 with st.spinner("Generating comment..."):
@@ -414,7 +596,6 @@ def main():
         selected_gem_name = st.selectbox("Select a Gem to Edit or Delete", options=[""] + gem_list, key="gem_editor_select")
 
         if selected_gem_name:
-            # Edit/Delete mode
             current_name = selected_gem_name
             current_prompt = st.session_state.gems.get(selected_gem_name, "")
             
