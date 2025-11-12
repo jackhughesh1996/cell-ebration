@@ -653,7 +653,7 @@ def main():
         else:
             st.subheader("Create a New Gem")
             gem_name = st.text_input("New Gem Name", key="new_gem_name")
-            gem_prompt = st.text_area("New Gem Prompt", key="new_gem_prompt", height=3D300)
+            gem_prompt = st.text_area("New Gem Prompt", key="new_gem_prompt", height=300)
             
             if st.button("Save New Gem"):
                 if gem_name and gem_prompt:
@@ -671,3 +671,4 @@ def main():
 # --- (6) THIS BLOCK RUNS THE SCRIPT ---
 if __name__ == "__main__":
     main()
+
