@@ -1,279 +1,4 @@
-import streamlit as st
-import google.generativeai as genai
-import pdfplumber
-import os
-import re
-import time
-import json
-from datetime import date
-import io # Used to save files in memory
-from docx import Document # For Word docs
-from docx.shared import Pt # For setting font sizes
-from docx.enum.text import WD_ALIGN_PARAGRAPH # For alignment
-
-# --- (1) PERSISTENT FILE HELPERS ---
-def load_from_file(filename, default_data):
-    """Loads data from a JSON file. If file doesn't exist or is old, creates a new one."""
-    today_str = str(date.today())
-    
-    if not os.path.exists(filename):
-        save_to_file(filename, default_data)
-        return default_data
-    
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        if filename == "usage.json" and data.get("date") != today_str:
-            st.success("New day! Resetting API counters.")
-            save_to_file(filename, default_data)
-            return default_data
-        
-        if filename == "usage.json" and "count" in data and "counts" not in data:
-            new_data = {
-                "date": data.get("date", today_str),
-                "counts": {"total_legacy_calls": data.get("count", 0)}
-            }
-            save_to_file(filename, new_data)
-            return new_data
-
-        return data
-            
-    except json.JSONDecodeError:
-        st.error(f"Error reading {filename}. File might be corrupt. Creating a new one.")
-        save_to_file(filename, default_data)
-        return default_data
-
-def save_to_file(filename, data):
-    """Saves data to a JSON file."""
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-# --- (2) CORE GEMINI API FUNCTION ---
-DELAYS = {
-    "gemini-2.5-flash-lite": 5,
-    "gemini-2.5-flash": 7,
-    "gemini-2.5-pro": 13
-}
-
-def call_gemini_api(system_prompt, user_prompt, temperature, model_name, chat_history=None):
-    """A single, safe function to call the Gemini API."""
-    api_key = st.session_state.get("api_key")
-    if not api_key:
-        st.error("API Key not set. Please enter your API key in the sidebar.")
-        return None
-
-    try:
-        genai.configure(api_key=api_key)
-        config = genai.GenerationConfig(temperature=temperature)
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_prompt,
-            generation_config=config
-        )
-        
-        if chat_history:
-            chat = model.start_chat(history=chat_history)
-            response = chat.send_message(user_prompt)
-        else:
-            response = model.generate_content(user_prompt)
-        
-        if model_name not in st.session_state.usage_data["counts"]:
-            st.session_state.usage_data["counts"][model_name] = 0
-        st.session_state.usage_data["counts"][model_name] += 1
-        save_to_file("usage.json", st.session_state.usage_data)
-        
-        delay = DELAYS.get(model_name, 7)
-        time.sleep(delay)
-        
-        return response.text
-
-    except Exception as e:
-        st.error(f"An API error occurred: {e}")
-        return None
-
-def create_toc_from_headings(html_content):
-    """Scans final HTML for h2 tags and builds a ToC."""
-    st.write("    > Building Table of Contents...")
-    headings = re.findall(
-        r'<h2\s+id=["\'](.*?)["\']>(.*?)</h2>', 
-        html_content,
-        re.IGNORECASE
-    )
-    if not headings:
-        st.write("    > No h2 headings with IDs found. Skipping ToC.")
-        return ""
-    toc_lines = ['<details class="toc" open><summary>Table of Contents</summary><ul>']
-    for id, text in headings:
-        toc_lines.append(f'<li><a href="#{id}">{text}</a></li>')
-    toc_lines.append('</ul></details><br><hr><br>')
-    st.write(f"    > ToC created with {len(headings)} entries.")
-    return "\n".join(toc_lines)
-
-# --- (3) DEFAULT DATA (FOR NEW FILES) ---
-DEFAULT_GEMS = {
-    "Blank Chat Prompt": "You are a helpful assistant.",
-    
-    # --- NEW: Upgraded Test Generator Gem ---
-    "Test Generator (.docx)": """
-You are an expert VCE Science exam designer.
-Your task is to generate a list of Multiple Choice Questions (MCQs) and Short Answer Questions (SAQs) based on a topic and a rubric.
-Your output MUST be a single, valid JSON object. Do not include ```json backticks or any other text.
-
-**CRITICAL INSTRUCTIONS:**
-1.  **Rubric Coverage:** You *must* generate at least one question that assesses each and every criterion in the provided rubric.
-2.  **Question Types:** Generate the exact number of MCQs and SAQs requested.
-3.  **Strict JSON:** The entire output must be a single JSON object.
-
-**JSON FORMAT:**
-{
-  "mcqs": [
-    {
-      "question_text": "The tendency to attribute our successes to internal factors and failures to external factors is called:",
-      "options": [
-        "A. Fundamental attribution error",
-        "B. Actor-observer bias",
-        "C. Self-serving bias",
-        "D. Cognitive dissonance"
-      ]
-    }
-  ],
-  "saqs": [
-    {
-      "question_text": "Explain the difference between the 'affective' and 'behavioural' components of an attitude, providing an example for each.",
-      "marks": 4
-    }
-  ]
-}
-""",
-    "PowerPoint Generator (.pptx)": """
-You are an expert VCE educator. Your task is to generate the *content* for a PowerPoint presentation based on a textbook chunk.
-The output format MUST be a specific JSON object. Do not include ```json backticks.
-Your entire response must be *only* the JSON object.
-**EXAMPLE:**
-{
-  "slides": [
-    {"title": "Slide 1 Title", "body": ["Bullet point 1", "Bullet point 2"]},
-    {"title": "Slide 2 Title", "body": ["Bullet point 1", "Bullet point 2", "Bullet point 3"]}
-  ]
-}
-""",
-    "Gimkit Generator (.csv)": """
-You are a question generator. Your task is to create a list of questions and answers on a given topic.
-The output format MUST be a valid CSV (Comma Separated Values) text.
-Do not add any other text, explanation, or ```csv backticks.
-Your entire response must be *only* the raw CSV data.
-**EXAMPLE OUTPUT:**
-"What is the capital of France?","Paris"
-"Who wrote Hamlet?","William Shakespeare"
-"What is 2+2?","4"
-""",
-    "Rubric Comment Generator": """
-You are an expert VCE teacher, skilled at writing constructive feedback.
-You will be given:
-1.  The test questions.
-2.  The rubric.
-3.  A description of what the student did correctly and incorrectly.
-Do not add any other text, just the final comment.
-
-**YOUR TASK:**
-Generate a concise, constructive comment (1-2 paragraphs) for a student report.
--   Start with what the student did well, referencing the rubric.
--   Clearly explain what they missed or misunderstood, referencing the questions.
--   Provide a clear, actionable "next step" for improvement.
--   Maintain a professional and encouraging tone.
-"""
-}
-DEFAULT_USAGE = {
-    "date": str(date.today()),
-    "counts": {
-        "gemini-2.5-flash-lite": 0,
-        "gemini-2.5-flash": 0,
-        "gemini-2.5-pro": 0
-    }
-}
-DEFAULT_CHATS = {}
-
-OUTPUT_FOLDER = r'C:\Users\hgh\OneDrive - Brentwood Secondary College\Desktop\Textbook_HTML_Files'
-
-# --- (4) NEW WORD DOC HELPER FUNCTIONS ---
-
-def find_and_replace(doc, find_str, replace_str):
-    """Finds and replaces text in all paragraphs and tables in a .docx"""
-    # Loop through paragraphs
-    for para in doc.paragraphs:
-        if find_str in para.text:
-            para.text = para.text.replace(find_str, replace_str)
-            
-    # Loop through tables
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    if find_str in para.text:
-                        para.text = para.text.replace(find_str, replace_str)
-
-def inject_mcq_questions(doc, mcqs):
-    """Finds the {{MCQ_SECTION}} placeholder and injects MCQs"""
-    for para in doc.paragraphs:
-        if "{{MCQ_SECTION}}" in para.text:
-            para.text = "" # Clear the placeholder
-            
-            p_section = doc.add_paragraph()
-            p_section.add_run("SECTION A – Multiple-Choice Questions").bold = True
-            
-            p_instructions = doc.add_paragraph()
-            p_instructions.add_run("Answer all questions by selecting the correct option.")
-            p_instructions.style = 'List Paragraph'
-            
-            for i, q_data in enumerate(mcqs):
-                doc.add_paragraph() # Add a space
-                q_para = doc.add_paragraph()
-                # Add "Question X" and the question text in bold
-                run = q_para.add_run(f"Question {i+1}\n")
-                run.bold = True
-                run = q_para.add_run(q_data.get("question_text", ""))
-                run.bold = True
-                
-                # Add the options (not bold)
-                for opt in q_data.get("options", []):
-                    doc.add_paragraph(opt, style='List Paragraph')
-            return True # Success
-    return False # Placeholder not found
-
-def inject_saq_questions(doc, saqs):
-    """Finds the {{SAQ_SECTION}} placeholder and injects SAQs"""
-    for para in doc.paragraphs:
-        if "{{SAQ_SECTION}}" in para.text:
-            para.text = "" # Clear the placeholder
-            
-            p_section = doc.add_paragraph()
-            p_section.add_run("SECTION B – Short-Answer Questions").bold = True
-            
-            p_instructions = doc.add_paragraph()
-            p_instructions.add_run("Answer all questions in the spaces provided.")
-            p_instructions.style = 'List Paragraph'
-            
-            for i, q_data in enumerate(saqs):
-                doc.add_paragraph() # Add a space
-                q_para = doc.add_paragraph()
-                
-                # Add "Question X (Y marks)" and the question text in bold
-                marks = q_data.get("marks", 1)
-                run = q_para.add_run(f"Question {i+1} ({marks} mark{'s' if marks > 1 else ''})\n")
-                run.bold = True
-                run = q_para.add_run(q_data.get("question_text", ""))
-                run.bold = True
-                
-                # Add blank lines for answer space (e.g., 3 lines per mark)
-                for _ in range(marks * 3):
-                    doc.add_paragraph("_________________________________________________________________")
-            
-            return True # Success
-    return False # Placeholder not found
-
-
-# --- (5) THIS IS THE MAIN FUNCTION THAT RUNS THE APP ---
+# --- (4) THIS IS THE MAIN FUNCTION THAT RUNS THE APP ---
 def main():
     """Main function to run the Streamlit app."""
     
@@ -407,9 +132,9 @@ def main():
         st.subheader("1. Fill in Title Page Details")
         col1, col2, col3 = st.columns(3)
         with col1:
-            subject_title = st.text_input("Subject Title", "e.g., Psychology")
+            subject_title = st.text_input("Subject Title", "Year 7 Science")
         with col2:
-            unit_title = st.text_input("Unit/SAC Title", "e.g., Unit 2 SAC Outcome 1")
+            unit_title = st.text_input("Unit/SAC Title", "Unit 2 SAC Outcome 1")
         with col3:
             year = st.text_input("Year", "2025")
 
@@ -420,10 +145,10 @@ def main():
             marks_mcq = st.number_input("Total Marks for MCQs", min_value=0, value=10)
         with col2:
             num_saq = st.number_input("Number of SAQs", min_value=0, value=5)
-            marks_saq = st.number_input("Total Marks for SAQs", min_value=0, value=20)
+            marks_saq = st.number_input("Total Marks for SAQs", min_value=0, value=10)
         
         st.subheader("3. Provide Content & Rubric")
-        topic = st.text_input("Topic for the test:", "e.g., The Atkinson-Shiffrin Model")
+        topic = st.text_input("Topic for the test:", "Year 7 Biology")
         rubric_text = st.text_area("Paste Rubric Here (to ensure question coverage):", "e.g., 'Criterion 1: Defines key terms.'\n'Criterion 2: Applies concepts to scenarios.'")
 
         if st.button("Generate Test"):
@@ -474,7 +199,9 @@ def main():
                         
                         replacements = {
                             "{{SUBJECT_TITLE}}": subject_title,
+                            "{{SUBJECT TITLE}}": subject_title, # <-- Added tolerance for the space
                             "{{UNIT_TITLE}}": unit_title,
+                            "{{Unit_Title}}": unit_title, # <-- Added tolerance for capitalization
                             "{{YEAR}}": year,
                             "{{MCQ_NUM}}": str(num_mcq),
                             "{{MCQ_MARKS}}": str(marks_mcq),
@@ -484,11 +211,18 @@ def main():
                             "{{TOTAL_MARKS}}": str(total_marks),
                         }
                         
+                        # --- NEW ROBUST REPLACEMENT LOGIC ---
+                        # This logic clears the entire paragraph and rebuilds it to avoid Word's "run" issues.
+                        
+                        # Replace in Paragraphs
                         for para in doc.paragraphs:
                             for key, value in replacements.items():
                                 if key in para.text:
                                     para.text = para.text.replace(key, value)
+                                    # Set alignment, just in case
+                                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                         
+                        # Replace in Tables
                         for table in doc.tables:
                             for row in table.rows:
                                 for cell in row.cells:
@@ -496,6 +230,7 @@ def main():
                                         for key, value in replacements.items():
                                             if key in para.text:
                                                 para.text = para.text.replace(key, value)
+                        # --- END NEW LOGIC ---
 
                         # --- 2. Inject Questions ---
                         st.write("  > Injecting MCQs and SAQs...")
