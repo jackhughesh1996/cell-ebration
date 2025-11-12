@@ -117,7 +117,8 @@ DEFAULT_GEMS = {
     "Test Generator (.docx)": """
 You are an expert VCE Psychology exam designer.
 Your task is to generate multiple-choice questions based on a topic.
-Your output MUST be a single JSON object.
+Your output MUST be a single JSON object. Do not include ```json backticks.
+Do not add *any* other text or explanation. Your entire response must be *only* the JSON object.
 The JSON object must contain one key, "questions", which is a list.
 Each item in the list must be an object with a "question_text" (the question) and a "options" (a list of 4 strings, A-D).
 
@@ -147,7 +148,8 @@ Each item in the list must be an object with a "question_text" (the question) an
 """,
     "PowerPoint Generator (.pptx)": """
 You are an expert VCE educator. Your task is to generate the *content* for a PowerPoint presentation based on a textbook chunk.
-The output format MUST be a specific JSON structure.
+The output format MUST be a specific JSON object. Do not include ```json backticks.
+Your entire response must be *only* the JSON object.
 **EXAMPLE:**
 {
   "slides": [
@@ -159,6 +161,8 @@ The output format MUST be a specific JSON structure.
     "Gimkit Generator (.csv)": """
 You are a question generator. Your task is to create a list of questions and answers on a given topic.
 The output format MUST be a valid CSV (Comma Separated Values) text.
+Do not add any other text, explanation, or ```csv backticks.
+Your entire response must be *only* the raw CSV data.
 **EXAMPLE OUTPUT:**
 "What is the capital of France?","Paris"
 "Who wrote Hamlet?","William Shakespeare"
@@ -170,6 +174,7 @@ You will be given:
 1.  The test questions.
 2.  The rubric.
 3.  A description of what the student did correctly and incorrectly.
+Do not add any other text, just the final comment.
 
 **YOUR TASK:**
 Generate a concise, constructive comment (1-2 paragraphs) for a student report.
@@ -329,6 +334,8 @@ def main():
         if st.button("Generate Test"):
             if not topic:
                 st.warning("Please fill in all fields.")
+            elif not st.session_state.api_key:
+                st.error("API Key not set. Please enter your API key in the sidebar.")
             else:
                 user_prompt = f"Topic: {topic}\nNumber of Questions: {num_questions}"
                 with st.spinner("Calling Gemini to generate questions (as JSON)..."):
@@ -342,30 +349,38 @@ def main():
                 if response:
                     try:
                         st.write("  > AI returned content. Parsing JSON...")
-                        # Clean the response from markdown backticks
-                        response_clean = re.sub(r'```json\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
+                        
+                        # --- NEW: More robust JSON cleaner ---
+                        # 1. Find the first '{' and the last '}'
+                        json_start = response.find('{')
+                        json_end = response.rfind('}') + 1
+                        
+                        if json_start == -1 or json_end == -1:
+                            raise json.JSONDecodeError("No JSON object found in response.", response, 0)
+                            
+                        # 2. Extract just that block
+                        response_clean = response[json_start:json_end]
+                        
+                        # 3. Load it
                         data = json.loads(response_clean)
+                        # --- END of new cleaner ---
                         
                         st.write("  > JSON parsed. Opening `test_template.docx`...")
                         
-                        # Check if template exists
-                        if not os.path.exists("test_template.docx"):
-                            st.error("`test_template.docx` not found! Please create it in the same folder as the app.")
+                        template_path = "test_template.docx"
+                        if not os.path.exists(template_path):
+                            st.error(f"`{template_path}` not found! Please create it in the same folder as the app.")
                             st.stop()
                             
-                        doc = Document("test_template.docx")
+                        doc = Document(template_path)
                         
-                        # Find the placeholder
                         found_placeholder = False
                         for para in doc.paragraphs:
                             if "{{QUESTIONS_GO_HERE}}" in para.text:
-                                # Found it! Clear the placeholder text
-                                para.text = ""
+                                para.text = "" # Clear the placeholder text
                                 
-                                # Add our new content
                                 st.write("  > Found placeholder. Injecting questions...")
                                 
-                                # Add Section A title
                                 p_section = doc.add_paragraph()
                                 p_section.add_run("SECTION A – Multiple-Choice Questions").bold = True
                                 
@@ -374,24 +389,21 @@ def main():
                                 p_instructions.style = 'List Paragraph'
 
                                 for i, q_data in enumerate(data.get("questions", [])):
-                                    # Add Question X (with a space before it)
                                     doc.add_paragraph() 
                                     q_para = doc.add_paragraph()
                                     q_para.add_run(f"Question {i+1}\n").bold = True
                                     q_para.add_run(q_data.get("question_text", ""))
                                     
-                                    # Add options (A, B, C, D)
                                     for opt in q_data.get("options", []):
                                         doc.add_paragraph(opt, style='List Paragraph')
                                 
                                 found_placeholder = True
-                                break # Stop searching
+                                break 
                         
                         if not found_placeholder:
                             st.error("Could not find the '{{QUESTIONS_GO_HERE}}' placeholder in 'test_template.docx'.")
                             st.stop()
 
-                        # Save to a memory buffer
                         st.write("  > Saving to memory buffer...")
                         bio = io.BytesIO()
                         doc.save(bio)
@@ -436,7 +448,6 @@ def main():
                     try:
                         with pdfplumber.open(uploaded_file) as pdf:
                             text_content = ""
-                            # Only read first 10 pages to save tokens
                             for page in pdf.pages[:10]: 
                                 text_content += page.extract_text() + "\n"
                         st.info("Reading first 10 pages of PDF...")
@@ -456,8 +467,15 @@ def main():
                     if response:
                         try:
                             st.write("  > AI returned content. Parsing JSON...")
-                            response_clean = re.sub(r'```json\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
+                            
+                            # --- NEW: More robust JSON cleaner ---
+                            json_start = response.find('{')
+                            json_end = response.rfind('}') + 1
+                            if json_start == -1 or json_end == -1:
+                                raise json.JSONDecodeError("No JSON object found in response.", response, 0)
+                            response_clean = response[json_start:json_end]
                             slide_data = json.loads(response_clean)
+                            # --- END of new cleaner ---
                             
                             from pptx import Presentation
                             
@@ -471,15 +489,15 @@ def main():
                                     slide.shapes.title.text = slide_info.get("title", "No Title")
                                 
                                 content_frame = slide.placeholders[1].text_frame
-                                content_frame.clear() # Clear existing placeholder text
+                                content_frame.clear() 
                                 
-                                p = content_frame.paragraphs[0]
-                                p.text = slide_info.get("body", [""])[0] # Add first bullet
-                                
-                                # Add remaining bullets
-                                for body_item in slide_info.get("body", [])[1:]:
-                                    p = content_frame.add_paragraph()
-                                    p.text = body_item
+                                body_list = slide_info.get("body", [])
+                                if body_list:
+                                    p = content_frame.paragraphs[0]
+                                    p.text = body_list[0]
+                                    for body_item in body_list[1:]:
+                                        p = content_frame.add_paragraph()
+                                        p.text = body_item
                             
                             bio = io.BytesIO()
                             prs.save(bio)
@@ -532,7 +550,10 @@ def main():
                 
                 if response:
                     st.success("CSV content generated!")
+                    
+                    # --- NEW: More robust CSV cleaner ---
                     response_clean = re.sub(r'```csv\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
+                    response_clean = response_clean.strip() # Remove extra newlines
                     
                     st.download_button(
                         label="Download Gimkit CSV",
@@ -632,7 +653,7 @@ def main():
         else:
             st.subheader("Create a New Gem")
             gem_name = st.text_input("New Gem Name", key="new_gem_name")
-            gem_prompt = st.text_area("New Gem Prompt", key="new_gem_prompt", height=300)
+            gem_prompt = st.text_area("New Gem Prompt", key="new_gem_prompt", height=3D300)
             
             if st.button("Save New Gem"):
                 if gem_name and gem_prompt:
