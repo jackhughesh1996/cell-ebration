@@ -7,8 +7,9 @@ import time
 import json
 from datetime import date
 import io # Used to save files in memory
-from docx import Document # <-- NEW: For Word docs
-from docx.shared import Pt # <-- NEW: For setting font sizes
+from docx import Document # For Word docs
+from docx.shared import Pt # For setting font sizes
+from docx.enum.text import WD_ALIGN_PARAGRAPH # For alignment
 
 # --- (1) PERSISTENT FILE HELPERS ---
 def load_from_file(filename, default_data):
@@ -115,16 +116,18 @@ DEFAULT_GEMS = {
     
     # --- NEW: Upgraded Test Generator Gem ---
     "Test Generator (.docx)": """
-You are an expert VCE Psychology exam designer.
-Your task is to generate multiple-choice questions based on a topic.
-Your output MUST be a single JSON object. Do not include ```json backticks.
-Do not add *any* other text or explanation. Your entire response must be *only* the JSON object.
-The JSON object must contain one key, "questions", which is a list.
-Each item in the list must be an object with a "question_text" (the question) and a "options" (a list of 4 strings, A-D).
+You are an expert VCE Science exam designer.
+Your task is to generate a list of Multiple Choice Questions (MCQs) and Short Answer Questions (SAQs) based on a topic and a rubric.
+Your output MUST be a single, valid JSON object. Do not include ```json backticks or any other text.
 
-**EXAMPLE:**
+**CRITICAL INSTRUCTIONS:**
+1.  **Rubric Coverage:** You *must* generate at least one question that assesses each and every criterion in the provided rubric.
+2.  **Question Types:** Generate the exact number of MCQs and SAQs requested.
+3.  **Strict JSON:** The entire output must be a single JSON object.
+
+**JSON FORMAT:**
 {
-  "questions": [
+  "mcqs": [
     {
       "question_text": "The tendency to attribute our successes to internal factors and failures to external factors is called:",
       "options": [
@@ -133,15 +136,12 @@ Each item in the list must be an object with a "question_text" (the question) an
         "C. Self-serving bias",
         "D. Cognitive dissonance"
       ]
-    },
+    }
+  ],
+  "saqs": [
     {
-      "question_text": "The affective component of an attitude involves:",
-      "options": [
-        "A. Observable behaviours toward an object, person, or event",
-        "B. Beliefs or thoughts about something",
-        "C. Feelings or emotional reactions",
-        "D. Judgements based on logic"
-      ]
+      "question_text": "Explain the difference between the 'affective' and 'behavioural' components of an attitude, providing an example for each.",
+      "marks": 4
     }
   ]
 }
@@ -196,8 +196,84 @@ DEFAULT_CHATS = {}
 
 OUTPUT_FOLDER = r'C:\Users\hgh\OneDrive - Brentwood Secondary College\Desktop\Textbook_HTML_Files'
 
+# --- (4) NEW WORD DOC HELPER FUNCTIONS ---
 
-# --- (4) THIS IS THE MAIN FUNCTION THAT RUNS THE APP ---
+def find_and_replace(doc, find_str, replace_str):
+    """Finds and replaces text in all paragraphs and tables in a .docx"""
+    # Loop through paragraphs
+    for para in doc.paragraphs:
+        if find_str in para.text:
+            para.text = para.text.replace(find_str, replace_str)
+            
+    # Loop through tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    if find_str in para.text:
+                        para.text = para.text.replace(find_str, replace_str)
+
+def inject_mcq_questions(doc, mcqs):
+    """Finds the {{MCQ_SECTION}} placeholder and injects MCQs"""
+    for para in doc.paragraphs:
+        if "{{MCQ_SECTION}}" in para.text:
+            para.text = "" # Clear the placeholder
+            
+            p_section = doc.add_paragraph()
+            p_section.add_run("SECTION A – Multiple-Choice Questions").bold = True
+            
+            p_instructions = doc.add_paragraph()
+            p_instructions.add_run("Answer all questions by selecting the correct option.")
+            p_instructions.style = 'List Paragraph'
+            
+            for i, q_data in enumerate(mcqs):
+                doc.add_paragraph() # Add a space
+                q_para = doc.add_paragraph()
+                # Add "Question X" and the question text in bold
+                run = q_para.add_run(f"Question {i+1}\n")
+                run.bold = True
+                run = q_para.add_run(q_data.get("question_text", ""))
+                run.bold = True
+                
+                # Add the options (not bold)
+                for opt in q_data.get("options", []):
+                    doc.add_paragraph(opt, style='List Paragraph')
+            return True # Success
+    return False # Placeholder not found
+
+def inject_saq_questions(doc, saqs):
+    """Finds the {{SAQ_SECTION}} placeholder and injects SAQs"""
+    for para in doc.paragraphs:
+        if "{{SAQ_SECTION}}" in para.text:
+            para.text = "" # Clear the placeholder
+            
+            p_section = doc.add_paragraph()
+            p_section.add_run("SECTION B – Short-Answer Questions").bold = True
+            
+            p_instructions = doc.add_paragraph()
+            p_instructions.add_run("Answer all questions in the spaces provided.")
+            p_instructions.style = 'List Paragraph'
+            
+            for i, q_data in enumerate(saqs):
+                doc.add_paragraph() # Add a space
+                q_para = doc.add_paragraph()
+                
+                # Add "Question X (Y marks)" and the question text in bold
+                marks = q_data.get("marks", 1)
+                run = q_para.add_run(f"Question {i+1} ({marks} mark{'s' if marks > 1 else ''})\n")
+                run.bold = True
+                run = q_para.add_run(q_data.get("question_text", ""))
+                run.bold = True
+                
+                # Add blank lines for answer space (e.g., 3 lines per mark)
+                for _ in range(marks * 3):
+                    doc.add_paragraph("_________________________________________________________________")
+            
+            return True # Success
+    return False # Placeholder not found
+
+
+# --- (5) THIS IS THE MAIN FUNCTION THAT RUNS THE APP ---
 def main():
     """Main function to run the Streamlit app."""
     
@@ -316,7 +392,7 @@ def main():
     # --- TAB 1: TEST GENERATOR (REBUILT) ---
     with tab_test:
         st.header("Test Generator (.docx)")
-        st.info("This tool uses a `test_template.docx` file in your app folder. Create one with your school's title page and add the placeholder `{{QUESTIONS_GO_HERE}}` where you want the questions to be inserted.")
+        st.info("This tool uses a `test_template.docx` file in your app folder. Please update it with the new placeholders!")
         
         gem_name = "Test Generator (.docx)"
         
@@ -328,16 +404,41 @@ def main():
                 key="gem_test"
             )
         
+        st.subheader("1. Fill in Title Page Details")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            subject_title = st.text_input("Subject Title", "e.g., Psychology")
+        with col2:
+            unit_title = st.text_input("Unit/SAC Title", "e.g., Unit 2 SAC Outcome 1")
+        with col3:
+            year = st.text_input("Year", "2025")
+
+        st.subheader("2. Define Test Structure")
+        col1, col2 = st.columns(2)
+        with col1:
+            num_mcq = st.number_input("Number of MCQs", min_value=0, value=10)
+            marks_mcq = st.number_input("Total Marks for MCQs", min_value=0, value=10)
+        with col2:
+            num_saq = st.number_input("Number of SAQs", min_value=0, value=5)
+            marks_saq = st.number_input("Total Marks for SAQs", min_value=0, value=20)
+        
+        st.subheader("3. Provide Content & Rubric")
         topic = st.text_input("Topic for the test:", "e.g., The Atkinson-Shiffrin Model")
-        num_questions = st.number_input("Number of questions:", min_value=1, max_value=20, value=5)
+        rubric_text = st.text_area("Paste Rubric Here (to ensure question coverage):", "e.g., 'Criterion 1: Defines key terms.'\n'Criterion 2: Applies concepts to scenarios.'")
 
         if st.button("Generate Test"):
-            if not topic:
-                st.warning("Please fill in all fields.")
+            if not all([topic, rubric_text, subject_title, unit_title, year]):
+                st.warning("Please fill in all fields to generate the test.")
             elif not st.session_state.api_key:
                 st.error("API Key not set. Please enter your API key in the sidebar.")
             else:
-                user_prompt = f"Topic: {topic}\nNumber of Questions: {num_questions}"
+                user_prompt = f"""
+                Topic: {topic}
+                Rubric: {rubric_text}
+                Number of MCQs: {num_mcq}
+                Number of SAQs: {num_saq}
+                Total Marks for SAQs: {marks_saq}
+                """
                 with st.spinner("Calling Gemini to generate questions (as JSON)..."):
                     response = call_gemini_api(
                         st.session_state.gems[gem_name],
@@ -350,60 +451,63 @@ def main():
                     try:
                         st.write("  > AI returned content. Parsing JSON...")
                         
-                        # --- NEW: More robust JSON cleaner ---
-                        # 1. Find the first '{' and the last '}'
                         json_start = response.find('{')
                         json_end = response.rfind('}') + 1
-                        
                         if json_start == -1 or json_end == -1:
                             raise json.JSONDecodeError("No JSON object found in response.", response, 0)
-                            
-                        # 2. Extract just that block
                         response_clean = response[json_start:json_end]
-                        
-                        # 3. Load it
                         data = json.loads(response_clean)
-                        # --- END of new cleaner ---
                         
                         st.write("  > JSON parsed. Opening `test_template.docx`...")
                         
                         template_path = "test_template.docx"
                         if not os.path.exists(template_path):
-                            st.error(f"`{template_path}` not found! Please create it in the same folder as the app.")
+                            st.error(f"`{template_path}` not found! Please create it and add the placeholders (e.g., {{SUBJECT_TITLE}}).")
                             st.stop()
                             
                         doc = Document(template_path)
                         
-                        found_placeholder = False
-                        for para in doc.paragraphs:
-                            if "{{QUESTIONS_GO_HERE}}" in para.text:
-                                para.text = "" # Clear the placeholder text
-                                
-                                st.write("  > Found placeholder. Injecting questions...")
-                                
-                                p_section = doc.add_paragraph()
-                                p_section.add_run("SECTION A – Multiple-Choice Questions").bold = True
-                                
-                                p_instructions = doc.add_paragraph()
-                                p_instructions.add_run("Answer all questions by selecting the correct option.")
-                                p_instructions.style = 'List Paragraph'
-
-                                for i, q_data in enumerate(data.get("questions", [])):
-                                    doc.add_paragraph() 
-                                    q_para = doc.add_paragraph()
-                                    q_para.add_run(f"Question {i+1}\n").bold = True
-                                    q_para.add_run(q_data.get("question_text", ""))
-                                    
-                                    for opt in q_data.get("options", []):
-                                        doc.add_paragraph(opt, style='List Paragraph')
-                                
-                                found_placeholder = True
-                                break 
+                        # --- 1. Replace Title Page & Table Placeholders ---
+                        st.write("  > Replacing placeholders...")
+                        total_questions = num_mcq + num_saq
+                        total_marks = marks_mcq + marks_saq
                         
-                        if not found_placeholder:
-                            st.error("Could not find the '{{QUESTIONS_GO_HERE}}' placeholder in 'test_template.docx'.")
-                            st.stop()
+                        replacements = {
+                            "{{SUBJECT_TITLE}}": subject_title,
+                            "{{UNIT_TITLE}}": unit_title,
+                            "{{YEAR}}": year,
+                            "{{MCQ_NUM}}": str(num_mcq),
+                            "{{MCQ_MARKS}}": str(marks_mcq),
+                            "{{SAQ_NUM}}": str(num_saq),
+                            "{{SAQ_MARKS}}": str(marks_saq),
+                            "{{TOTAL_QUESTIONS}}": str(total_questions),
+                            "{{TOTAL_MARKS}}": str(total_marks),
+                        }
+                        
+                        for para in doc.paragraphs:
+                            for key, value in replacements.items():
+                                if key in para.text:
+                                    para.text = para.text.replace(key, value)
+                        
+                        for table in doc.tables:
+                            for row in table.rows:
+                                for cell in row.cells:
+                                    for para in cell.paragraphs:
+                                        for key, value in replacements.items():
+                                            if key in para.text:
+                                                para.text = para.text.replace(key, value)
 
+                        # --- 2. Inject Questions ---
+                        st.write("  > Injecting MCQs and SAQs...")
+                        mcq_success = inject_mcq_questions(doc, data.get("mcqs", []))
+                        saq_success = inject_saq_questions(doc, data.get("saqs", []))
+                        
+                        if not mcq_success:
+                            st.warning("Could not find '{{MCQ_SECTION}}' placeholder. MCQs were not added.")
+                        if not saq_success:
+                            st.warning("Could not find '{{SAQ_SECTION}}' placeholder. SAQs were not added.")
+
+                        # --- 3. Save to memory buffer ---
                         st.write("  > Saving to memory buffer...")
                         bio = io.BytesIO()
                         doc.save(bio)
@@ -412,7 +516,7 @@ def main():
                         st.download_button(
                             label="Download Test as .docx",
                             data=bio.getvalue(),
-                            file_name=f"{topic.replace(' ', '_')}_test.docx",
+                            file_name=f"{subject_title.replace(' ', '_')}_{unit_title.replace(' ', '_')}_test.docx",
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                         )
                         
@@ -468,14 +572,12 @@ def main():
                         try:
                             st.write("  > AI returned content. Parsing JSON...")
                             
-                            # --- NEW: More robust JSON cleaner ---
                             json_start = response.find('{')
                             json_end = response.rfind('}') + 1
                             if json_start == -1 or json_end == -1:
                                 raise json.JSONDecodeError("No JSON object found in response.", response, 0)
                             response_clean = response[json_start:json_end]
                             slide_data = json.loads(response_clean)
-                            # --- END of new cleaner ---
                             
                             from pptx import Presentation
                             
@@ -551,9 +653,8 @@ def main():
                 if response:
                     st.success("CSV content generated!")
                     
-                    # --- NEW: More robust CSV cleaner ---
                     response_clean = re.sub(r'```csv\n(.*?)\n```', r'\1', response, flags=re.DOTALL)
-                    response_clean = response_clean.strip() # Remove extra newlines
+                    response_clean = response_clean.strip() 
                     
                     st.download_button(
                         label="Download Gimkit CSV",
@@ -671,4 +772,3 @@ def main():
 # --- (6) THIS BLOCK RUNS THE SCRIPT ---
 if __name__ == "__main__":
     main()
-
